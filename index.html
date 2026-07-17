@@ -1013,12 +1013,12 @@
       "PASTE_..." placeholder.
    ============================================================================ */
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyAcff37-OjCVKkY83HiSA3iwSkqYQOlxVQ",
-  authDomain: "event-management-dashboa-caf40.firebaseapp.com",
-  projectId: "event-management-dashboa-caf40",
-  storageBucket: "event-management-dashboa-caf40.firebasestorage.app",
-  messagingSenderId: "1028378762774",
-  appId: "1:1028378762774:web:65b77aa3527586a0be5f37"
+  apiKey: "PASTE_YOUR_API_KEY_HERE",
+  authDomain: "PASTE_YOUR_AUTH_DOMAIN_HERE",
+  projectId: "PASTE_YOUR_PROJECT_ID_HERE",
+  storageBucket: "PASTE_YOUR_STORAGE_BUCKET_HERE",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID_HERE",
+  appId: "PASTE_YOUR_APP_ID_HERE"
 };
 
 const FIREBASE_CONFIGURED = FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.startsWith('PASTE_');
@@ -1864,10 +1864,43 @@ function submitForApproval(id){
   // just wants to hit one button. They're available as optional actions on the Approved card.
 }
 
-// Posts an Adaptive-Card-style notification to a Teams Incoming Webhook. Sent with mode:'no-cors'
-// since Teams' webhook endpoint doesn't reliably return CORS headers for browser-side calls --
-// that means we can send the request but can't read whether it actually succeeded, which is why
-// there's a "Send Test Message" button in Settings to confirm delivery once, up front.
+// Posts a payload to a Teams webhook and tries hard to get a REAL answer about whether it
+// worked, instead of always guessing. First attempts a normal fetch (readable response) --
+// this works fine outside sandboxed environments like Claude.ai's artifact viewer, and gives a
+// definitive success/failure. Only if that's blocked (a genuine CORS restriction from the
+// webhook's own server) does it fall back to a blind no-cors send, which can't confirm delivery.
+async function postToTeamsWebhook(url, payload){
+  try{
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if(res.ok){
+      return { status: 'confirmed-success', message: `Delivered successfully (HTTP ${res.status}).` };
+    }
+    let bodyText = '';
+    try{ bodyText = await res.text(); }catch(e){}
+    return { status: 'confirmed-failure', message: `Teams rejected the request (HTTP ${res.status}). ${bodyText ? 'Response: ' + bodyText.slice(0,300) : 'Check that the webhook URL is correct and still active.'}` };
+  }catch(e){
+    // Real network/CORS block -- fall back to a blind send so the message still has a chance
+    // of arriving, but be honest that we can't confirm it.
+    try{
+      await fetch(url, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify(payload)
+      });
+      return { status: 'sent-blind', message: `Could not read a response (likely a CORS restriction: "${e.message}"), so this was sent blind. Check the Teams channel directly to confirm.` };
+    }catch(e2){
+      return { status: 'failed', message: `Failed to send at all: "${e2.message}". This usually means the URL itself is wrong or unreachable.` };
+    }
+  }
+}
+
+// Posts an Adaptive-Card-style notification to a Teams Incoming Webhook via postToTeamsWebhook
+// above, which now gives a real, confirmed result whenever the hosting environment allows it.
 async function notifyTeams(ev){
   if(!state.teamsWebhookUrl) return;
   const region = state.regionNames[ev.region];
@@ -1891,15 +1924,10 @@ async function notifyTeams(ev){
       "text": "This event has cleared the pre-approval checklist and is ready for review."
     }]
   };
-  try{
-    await fetch(state.teamsWebhookUrl, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify(payload)
-    });
-  }catch(e){
-    console.error('Teams webhook request failed to send', e);
+  const result = await postToTeamsWebhook(state.teamsWebhookUrl, payload);
+  console.log('Teams notification result:', result.status, '-', result.message);
+  if(result.status === 'confirmed-failure' || result.status === 'failed'){
+    console.error('Teams notification did not succeed:', result.message);
   }
 }
 
@@ -3660,28 +3688,19 @@ function attachHandlers(){
       }
       state.teamsWebhookStatus = 'Sending test message…';
       render();
-      try{
-        await fetch(url, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'text/plain' },
-          body: JSON.stringify({
-            "@type": "MessageCard",
-            "@context": "http://schema.org/extensions",
-            "summary": "Test message",
-            "themeColor": "2F7A78",
-            "title": "Regional Events Dashboard — Test Message",
-            "sections": [{
-              "activityTitle": (document.getElementById('f_teamsAlertName')?.value.trim()) || state.teamsAlertName || 'Regional Events Dashboard',
-              "text": "If you can see this in Teams, the webhook is working."
-            }]
-          })
-        });
-        state.teamsWebhookStatus = 'Test message sent — check the Teams channel now. (Browser CORS rules mean we can\'t confirm delivery here, so if it doesn\'t show up, the tenant is likely blocking direct browser requests.)';
-      }catch(e){
-        console.error('Teams webhook test failed:', e);
-        state.teamsWebhookStatus = `Request failed: "${e.message}". This usually means the browser itself is blocking the outbound call (often a Content Security Policy restriction in this environment), not a bad URL. Open your browser's Developer Console (F12) and try again to see the full error.`;
-      }
+      const result = await postToTeamsWebhook(url, {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "summary": "Test message",
+        "themeColor": "2F7A78",
+        "title": "Regional Events Dashboard — Test Message",
+        "sections": [{
+          "activityTitle": (document.getElementById('f_teamsAlertName')?.value.trim()) || state.teamsAlertName || 'Regional Events Dashboard',
+          "text": "If you can see this in Teams, the webhook is working."
+        }]
+      });
+      const icon = result.status === 'confirmed-success' ? '✅ ' : result.status === 'sent-blind' ? '❓ ' : '❌ ';
+      state.teamsWebhookStatus = icon + result.message;
       render();
     });
   }
