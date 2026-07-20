@@ -1018,8 +1018,7 @@ const FIREBASE_CONFIG = {
   projectId: "event-management-dashboa-caf40",
   storageBucket: "event-management-dashboa-caf40.firebasestorage.app",
   messagingSenderId: "1028378762774",
-  appId: "1:1028378762774:web:65b77aa3527586a0be5f37",
-  measurementId: "G-MBDMRTPNRN"
+  appId: "1:1028378762774:web:65b77aa3527586a0be5f37"
 };
 
 const FIREBASE_CONFIGURED = FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.startsWith('PASTE_');
@@ -1120,6 +1119,36 @@ const STALENESS_LABEL = {
 };
 
 // Submission cutoff = last day of the month before the event's start date.
+// Month/quarter period helpers, used by the region summary's date filter on Overview.
+function eventMonthKey(ev){
+  if(!ev.startDate) return null;
+  return ev.startDate.slice(0,7); // "YYYY-MM"
+}
+function eventQuarterKey(ev){
+  if(!ev.startDate) return null;
+  const [y, m] = ev.startDate.split('-');
+  const q = Math.ceil(parseInt(m,10)/3);
+  return `${y}-Q${q}`;
+}
+function monthKeyLabel(key){
+  const [y,m] = key.split('-');
+  const d = new Date(parseInt(y,10), parseInt(m,10)-1, 1);
+  return d.toLocaleDateString(undefined, {month:'long', year:'numeric'});
+}
+function eventMatchesPeriod(ev, type, period){
+  if(type==='all' || !period) return true;
+  if(type==='month') return eventMonthKey(ev) === period;
+  if(type==='quarter') return eventQuarterKey(ev) === period;
+  return true;
+}
+function getAvailablePeriods(allEvents, type){
+  if(type==='all') return [];
+  const keyFn = type==='month' ? eventMonthKey : eventQuarterKey;
+  const keys = new Set();
+  allEvents.forEach(ev=>{ const k = keyFn(ev); if(k) keys.add(k); });
+  return Array.from(keys).sort();
+}
+
 function getSubmissionCutoff(startDate){
   if(!startDate) return null;
   const d = new Date(startDate + 'T00:00:00');
@@ -1195,7 +1224,12 @@ let state = {
     staleResearch:false,
     needsDecision:true,
     activity:false
-  }
+  },
+  regionSummaryPeriodType:'all',
+  regionSummaryPeriod:'',
+  authorizedApprovers:[],
+  authorizedApproversDraft:'',
+  approversStatus:''
 };
 
 function uid(){ return 'evt_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
@@ -1500,6 +1534,15 @@ async function loadData(){
   }
 
   try{
+    const approversRes = await window.storage.get('authorized-approvers', true);
+    if(approversRes && approversRes.value){
+      state.authorizedApprovers = JSON.parse(approversRes.value) || [];
+    }
+  }catch(e){
+    // no restriction configured yet -- everyone can approve, which is the default anyway
+  }
+
+  try{
     const userNameRes = await window.storage.get('user-display-name', false);
     if(userNameRes && userNameRes.value){
       state.userName = userNameRes.value;
@@ -1722,6 +1765,17 @@ function logActivity(eventId, eventName, action, details){
   }
 }
 
+// Soft, name-based gate on who can submit for contract processing -- NOT real security (this
+// app has no login system, only a self-reported display name), just a workflow guardrail to
+// help prevent accidental submissions by the wrong person. If the list is empty, everyone can
+// submit (the restriction is simply "off").
+function isAuthorizedApprover(){
+  if(!state.authorizedApprovers || state.authorizedApprovers.length===0) return true;
+  const name = (state.userName || '').trim().toLowerCase();
+  if(!name) return false;
+  return state.authorizedApprovers.some(a => a.trim().toLowerCase() === name);
+}
+
 function humanizeFieldKey(key){
   return key.replace(/([A-Z])/g, ' $1').replace(/^./, c=>c.toUpperCase()).trim();
 }
@@ -1814,6 +1868,58 @@ function deleteEvent(id){
   logActivity(null, ev ? ev.eventName : 'Unknown event', 'Deleted event');
   state.events = state.events.filter(e=>e.id!==id);
   persist();
+  render();
+}
+
+// Shifts a "YYYY-MM-DD" date forward exactly one year, same month/day -- except Feb 29, which
+// rolls to Feb 28 if the following year isn't a leap year.
+function shiftDateNextYear(dateStr){
+  if(!dateStr) return '';
+  const parts = dateStr.split('-').map(Number);
+  const y = parts[0], m = parts[1], d = parts[2];
+  if(!y || !m || !d) return dateStr;
+  const newYear = y + 1;
+  const isLeap = yr => (yr%4===0 && yr%100!==0) || yr%400===0;
+  const newDay = (m===2 && d===29 && !isLeap(newYear)) ? 28 : d;
+  return `${newYear}-${String(m).padStart(2,'0')}-${String(newDay).padStart(2,'0')}`;
+}
+
+// Copies an event to a new Researching entry one year later (same month/day). Approval-specific
+// fields (checklist answers, submission timestamps, contract attachment) are cleared, since
+// those need to be re-verified for the new year rather than carried over automatically.
+function duplicateEventNextYear(id){
+  const original = state.events.find(e=>e.id===id);
+  if(!original) return;
+  const newStart = shiftDateNextYear(original.startDate);
+  if(!confirm(`Duplicate "${original.eventName}" for next year${newStart ? ' ('+newStart+')' : ''}? This creates a new Researching event marked as a Show Renewal, with the checklist and contract attachment cleared for re-verification.`)) return;
+
+  const copy = JSON.parse(JSON.stringify(original));
+  copy.id = uid();
+  copy.startDate = newStart;
+  copy.endDate = shiftDateNextYear(original.endDate);
+  copy.status = STATUS.RESEARCHING;
+  copy.createdAt = Date.now();
+  copy.submittedAt = null;
+  copy.deniedAt = null;
+  copy.deniedBySupervisor = false;
+  copy.notPursuingAt = null;
+  copy.verifiedServiceArea = '';
+  copy.confirmedAcceptance = '';
+  copy.contractFileName = '';
+  copy.contractFileType = '';
+  copy.contractFileData = '';
+  copy.history = [];
+  // A duplicated event is, by definition, a renewal of a show that already ran -- mark it as
+  // such so the pre-approval checklist requires a Historical Show Code before it can move
+  // forward. If the original already had a code, carry it over as a starting point (still
+  // editable) rather than making the person re-type something that's often unchanged year to year.
+  copy.submissionType = 'renewal';
+
+  state.events.push(copy);
+  logActivity(copy.id, copy.eventName, 'Created event', 'Duplicated from previous year\'s event');
+  persist();
+  state.expandedEventId = copy.id;
+  state.activeRegion = copy.region;
   render();
 }
 
@@ -1937,6 +2043,12 @@ function submitContract(id){
   const missing = getMissingFields(ev);
   if(missing.length>0){
     alert('This event is missing required information and cannot be submitted for contract processing yet:\n\n' + missing.join(', '));
+    return;
+  }
+  if(!isAuthorizedApprover()){
+    alert(state.userName
+      ? `"${state.userName}" isn't on the list of authorized approvers, so this event can't be submitted for contract processing. Check with whoever manages the approver list in Settings.`
+      : 'Only authorized approvers can submit for contract processing. Set your name first (top of the page), then check with whoever manages the approver list.');
     return;
   }
   ev.status = STATUS.SUBMITTED;
@@ -2072,6 +2184,134 @@ function generateApprovalPDF(ev){
   doc.save(filename);
 }
 
+// Same layout as the approval PDF, but usable at any stage (not just Approved) -- available as
+// a "Download / Print PDF" button on every event, regardless of status.
+function downloadEventPDF(ev){
+  if(!(window.jspdf && window.jspdf.jsPDF)){
+    console.error('jsPDF failed to load; skipping PDF generation.');
+    return;
+  }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'pt', format:'letter' });
+  const marginX = 48;
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const maxWidth = pageWidth - marginX*2;
+  let y = 56;
+
+  function ensureSpace(lines){
+    if(y + lines*13 > pageHeight - 48){
+      doc.addPage();
+      y = 56;
+    }
+  }
+  function addTitle(text){
+    ensureSpace(2);
+    doc.setFont('helvetica','bold'); doc.setFontSize(18);
+    doc.text(text, marginX, y);
+    y += 22;
+  }
+  function addSubtitle(text){
+    ensureSpace(1);
+    doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(100);
+    doc.text(text, marginX, y);
+    doc.setTextColor(0);
+    y += 20;
+  }
+  function addSectionHeader(text){
+    ensureSpace(2);
+    y += 6;
+    doc.setFont('helvetica','bold'); doc.setFontSize(12);
+    doc.text(text.toUpperCase(), marginX, y);
+    y += 4;
+    doc.setDrawColor(180);
+    doc.line(marginX, y, pageWidth-marginX, y);
+    y += 14;
+    doc.setFont('helvetica','normal'); doc.setFontSize(10);
+  }
+  function addRow(label, value){
+    const text = label ? `${label}: ${(value===undefined||value===null||value==='') ? '—' : value}` : (value || '');
+    if(!text) return;
+    const wrapped = doc.splitTextToSize(text, maxWidth);
+    ensureSpace(wrapped.length);
+    doc.text(wrapped, marginX, y);
+    y += wrapped.length * 13;
+  }
+
+  const region = state.regionNames[ev.region];
+
+  addTitle('Event Details');
+  addSubtitle(`Generated ${new Date().toLocaleDateString(undefined,{year:'numeric',month:'long',day:'numeric'})} — Status: ${STATUS_LABEL[ev.status]}`);
+
+  addSectionHeader('Event Overview');
+  addRow('Event Name', ev.eventName);
+  addRow('Region', region);
+  addRow('Branch', ev.branch);
+  addRow('Venue Name', ev.venueName);
+  addRow('Venue Address', venueAddressDisplay(ev));
+  addRow('Location Zip Code', ev.zip);
+  addRow('Start Date', ev.startDate);
+  addRow('End Date', ev.endDate);
+  addRow('Event Organizer Company Name', ev.organizer);
+  addRow('Website', ev.website);
+  addRow('Target Opps', ev.forecastedOpps);
+  addRow('Cost Per Opp', costPerOppDisplay(ev));
+
+  addSectionHeader('Financials');
+  addRow('Contract Cost', moneyOrText(ev.contractCost));
+  addRow('Forecasted Labor Hours', ev.laborHours);
+  addRow('Labor Cost (@ $20/hr)', money(laborDollars(ev)));
+  addRow('Forecasted Mileage', withUnit(ev.mileage, ' mi'));
+  addRow('Mileage Cost (@ $0.725/mi after 30 free)', money(mileageDollars(ev)));
+  addRow('Hotel Nights', ev.hotelNights);
+  addRow('Hotel Cost (@ $150/night)', money(hotelDollars(ev)));
+  addRow('Per Diem (@ $43/night)', money(perDiemDollars(ev)));
+  addRow('Misc. Costs', moneyOrText(ev.miscCosts));
+  addRow('Total Costs', money(totalCost(ev)));
+
+  addSectionHeader('Contact');
+  addRow('Name of Contact', ev.contactName);
+  addRow('Phone', ev.contactPhone);
+  addRow('Email', ev.contactEmail);
+
+  addSectionHeader('Pre-Approval Checklist');
+  addRow('Verified Serviceable Area (Map Viewer)', ev.verifiedServiceArea==='yes'?'Yes':ev.verifiedServiceArea==='no'?'No':'');
+  addRow('Confirmed Acceptance w/ Promoter', ev.confirmedAcceptance==='yes'?'Yes':ev.confirmedAcceptance==='no'?'No':'');
+  addRow("Supervisor's Email", ev.supervisorEmail);
+  addRow('Priority Level', ev.priorityLevel ? ev.priorityLevel.charAt(0).toUpperCase()+ev.priorityLevel.slice(1) : '');
+  addRow('Submission Type', ev.submissionType==='new'?'New Show':ev.submissionType==='renewal'?'Show Renewal':'');
+  if(ev.submissionType==='renewal') addRow('Historical Show Code', ev.historicalShowCode);
+  addRow('Show Registration Link', ev.registrationLink);
+  addRow('Contract Document', ev.contractFileName || '');
+
+  addSectionHeader('Payment Information');
+  addRow('Due Date', ev.paymentDueDate);
+  addRow('Payment Method', ev.paymentMethod==='credit_card'?'Credit Card':ev.paymentMethod==='pay_at_gate'?'Pay at the Gate':ev.paymentMethod==='phone_payment'?'Phone Payment':ev.paymentMethod==='check'?'Check (not preferred)':ev.paymentMethod==='other'?'Other':'');
+  if(ev.paymentMethod==='credit_card') addRow('Credit Card Payment Link', ev.creditCardLink);
+  if(ev.paymentMethod==='phone_payment') addRow('Payment Phone Number', ev.paymentPhoneNumber);
+  addRow('Payment Notes', ev.paymentNotes);
+  addRow('COI Required', ev.coiRequired==='yes'?'Yes':ev.coiRequired==='no'?'No':'');
+  if(ev.coiRequired==='yes') addRow('COI Address', ev.coiAddress);
+  addRow('3rd Party Payment Requests', ev.thirdPartyPayment==='yes'?'Yes':ev.thirdPartyPayment==='no'?'No':'');
+  if(ev.thirdPartyPayment==='yes'){
+    addRow('3rd Party Name', ev.thirdPartyName);
+    addRow('3rd Party Phone', ev.thirdPartyPhone);
+    addRow('3rd Party Payment Info', ev.thirdPartyPaymentInfo);
+  }
+
+  if(ev.notes){
+    addSectionHeader('Research Notes');
+    addRow('', ev.notes);
+  }
+  if(ev.finalNotes){
+    addSectionHeader('Final Notes');
+    addRow('', ev.finalNotes);
+  }
+
+  const filename = `event-details_${(ev.eventName||'event').replace(/[^a-z0-9]+/gi,'-').toLowerCase()}.pdf`;
+  doc.save(filename);
+}
+
 function autoLink(value){
   const v = value ? String(value).trim() : '';
   if(!v) return '—';
@@ -2158,6 +2398,84 @@ function generateApprovalEmail(ev){
 
   const mailtoUrl = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(bodyText)}`;
   window.location.href = mailtoUrl;
+}
+
+const CONTRACTING_EMAIL = 'shanautica.sales@greatdayimprovements.com';
+
+// Sends the event's full details to the contracting team's fixed inbox, for whoever is
+// authorized to approve to hand off once an event is ready to move forward. Same
+// mailto-based approach as Email Supervisor -- opens a compose window, doesn't send silently.
+function generateContractingEmail(ev){
+  const region = state.regionNames[ev.region];
+  const to = CONTRACTING_EMAIL;
+  const subject = sanitizeHeader(`Contract Processing: ${ev.eventName}`);
+
+  const priorityLabel = ev.priorityLevel ? ev.priorityLevel.charAt(0).toUpperCase()+ev.priorityLevel.slice(1) : '—';
+  const submissionLabel = ev.submissionType==='renewal'
+    ? `Show Renewal (historical code: ${ev.historicalShowCode || '—'})`
+    : 'New Show';
+  const paymentMethodLabel = ev.paymentMethod==='credit_card' ? 'Credit Card'
+    : ev.paymentMethod==='pay_at_gate' ? 'Pay at the Gate'
+    : ev.paymentMethod==='phone_payment' ? `Phone Payment (${ev.paymentPhoneNumber || '—'})`
+    : ev.paymentMethod==='check' ? 'Check (not preferred)'
+    : ev.paymentMethod==='other' ? 'Other' : '—';
+  const coiLabel = ev.coiRequired==='yes' ? `Yes — ${ev.coiAddress || 'address on file'}` : 'No';
+  const hasAttachment = !!(ev.contractFileName && ev.contractFileData);
+
+  if(hasAttachment){
+    downloadContractFile(ev);
+  }
+  downloadEventPDF(ev);
+
+  const attachmentNote = hasAttachment
+    ? `${ev.contractFileName} (downloaded separately — please attach before sending)`
+    : '—';
+
+  let bodyLines = [
+    'Hi,',
+    '',
+    `The following event has been approved${state.userName ? ` by ${state.userName}` : ''} and is ready for contract processing:`,
+    '',
+    `Event: ${ev.eventName}`,
+    `Region / Branch: ${region} / ${ev.branch || '—'}`,
+    `Venue: ${ev.venueName || '—'} — ${venueAddressDisplay(ev) || '—'}`,
+    `Location Zip Code: ${ev.zip || '—'}`,
+    `Dates: ${ev.startDate || '—'} to ${ev.endDate || '—'}`,
+    `Priority: ${priorityLabel}`,
+    `Submission Type: ${submissionLabel}`,
+    '',
+    `Contract Cost: ${moneyOrText(ev.contractCost)}`,
+    `Total Estimated Cost: ${money(totalCost(ev))}`,
+    `Target Opps: ${ev.forecastedOpps || '—'}`,
+    `Cost Per Opp: ${costPerOppDisplay(ev)}`,
+    '',
+    `Payment Due: ${ev.paymentDueDate || '—'} via ${paymentMethodLabel}`,
+    ev.paymentMethod==='credit_card' ? `Credit Card Payment Link: ${ev.creditCardLink || '—'}` : '',
+    ev.paymentMethod==='phone_payment' ? `Payment Phone Number: ${ev.paymentPhoneNumber || '—'}` : '',
+    `COI Required: ${coiLabel}`,
+    '',
+    `Organizer: ${ev.organizer || '—'}`,
+    `Contact: ${ev.contactName || '—'} — ${ev.contactPhone || '—'} — ${ev.contactEmail || '—'}`,
+    '',
+    `Show Registration Link: ${ev.registrationLink || '—'}`,
+    `Contract Document: ${attachmentNote}`,
+    '',
+    ev.finalNotes ? `Notes: ${ev.finalNotes}` : '',
+    '',
+    'A full event details PDF was downloaded alongside this email — please attach it before sending.',
+    '',
+    'Thanks,'
+  ].filter((line, i, arr) => !(line === '' && arr[i-1] === ''));
+
+  let bodyText = bodyLines.join('\n');
+  const MAX_BODY_CHARS = 1900;
+  if(bodyText.length > MAX_BODY_CHARS){
+    bodyText = bodyText.slice(0, MAX_BODY_CHARS) + '\n\n[Message truncated — see the downloaded PDF for full details.]';
+  }
+
+  const mailtoUrl = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(bodyText)}`;
+  window.location.href = mailtoUrl;
+  logActivity(ev.id, ev.eventName, 'Emailed to contracting', CONTRACTING_EMAIL);
 }
 
 function downloadContractFile(ev){
@@ -2486,7 +2804,7 @@ function render(){
           <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value">${submittedCount}</div></div>
           <div class="stat"><div class="stat-label">Est. Pipeline Value</div><div class="stat-value">${money(totalPipeline)}</div></div>
           ${pendingApprovalCount>0 ? `<button class="pending-approval-badge" id="pendingApprovalBadge">⚠ ${pendingApprovalCount} Pending Approval</button>` : ''}
-          <button class="btn btn-outline btn-sm" id="settingsBtn" style="align-self:center;">⚙ Notifications</button>
+          <button class="btn btn-outline btn-sm" id="settingsBtn" style="align-self:center;">⚙ Settings</button>
         </div>
       </div>
       <div class="tab-strip">${tabsHtml}</div>
@@ -2571,9 +2889,10 @@ function renderOverview(allEvents){
     </div>
   `;
 
-  // Per-region rollup, sorted by total value desc
+  // Per-region rollup, sorted by total value desc -- scoped to the selected month/quarter period
+  const periodFilteredEvents = allEvents.filter(ev => eventMatchesPeriod(ev, state.regionSummaryPeriodType, state.regionSummaryPeriod));
   const regionRollups = state.regionNames.map((name, idx)=>{
-    const evs = allEvents.filter(e=>e.region===idx);
+    const evs = periodFilteredEvents.filter(e=>e.region===idx);
     const total = evs.reduce((s,e)=>s+totalCost(e),0);
     const counts = {
       researching: evs.filter(e=>e.status===STATUS.RESEARCHING).length,
@@ -2589,7 +2908,7 @@ function renderOverview(allEvents){
   // Full per-region breakdown table -- same stats as the top KPIs, split out per region,
   // with a click-to-expand branch-level breakdown underneath each region row.
   function branchRollupForRegion(regionIdx){
-    const evs = allEvents.filter(e=>e.region===regionIdx);
+    const evs = periodFilteredEvents.filter(e=>e.region===regionIdx);
     const groups = {};
     evs.forEach(e=>{
       const key = (e.branch && e.branch.trim()) ? e.branch.trim() : '(No branch assigned)';
@@ -2747,11 +3066,29 @@ function renderOverview(allEvents){
     </div>`;
   }
 
+  const availablePeriods = getAvailablePeriods(allEvents, state.regionSummaryPeriodType);
+  const periodFilterHtml = `
+    <div class="search-sort-bar" style="margin:-2px 0 10px 0;">
+      <select id="regionSummaryPeriodType">
+        <option value="all" ${state.regionSummaryPeriodType==='all'?'selected':''}>All Time</option>
+        <option value="month" ${state.regionSummaryPeriodType==='month'?'selected':''}>Monthly</option>
+        <option value="quarter" ${state.regionSummaryPeriodType==='quarter'?'selected':''}>Quarterly</option>
+      </select>
+      ${state.regionSummaryPeriodType!=='all' ? `
+      <select id="regionSummaryPeriod">
+        <option value="">Select a ${state.regionSummaryPeriodType}…</option>
+        ${availablePeriods.map(p=>`<option value="${p}" ${state.regionSummaryPeriod===p?'selected':''}>${state.regionSummaryPeriodType==='month'?monthKeyLabel(p):p}</option>`).join('')}
+      </select>` : ''}
+      <span class="search-result-count">${periodFilteredEvents.length} of ${allEvents.length} events in view</span>
+    </div>
+  `;
+
   return `
     ${kpiHtml}
     ${sectionHeader('regionSummary', 'Full Summary by Region')}
     ${state.overviewSectionsOpen.regionSummary ? `
       <div class="hint" style="margin:-6px 0 10px 2px;">Click a region to see its branch-level breakdown.</div>
+      ${periodFilterHtml}
       ${regionTableHtml}
     ` : ''}
 
@@ -2933,17 +3270,23 @@ function renderEventDetail(ev){
     }
   } else if(ev.status===STATUS.EXECUTE){
     const missing = getMissingFields(ev);
+    const authorized = isAuthorizedApprover();
     if(missing.length===0){
       decisionButtons = `
-        <div class="decision-note">Approved — a PDF summary was downloaded. Email and Teams notification are optional, below. Ready to process contract.</div>
+        <div class="decision-note">Approved — a PDF summary was downloaded. Email and Teams notification are optional, below. Ready to process contract.${!authorized ? ` <span style="color:var(--red);">Only authorized approvers can submit for contract processing — ${state.userName ? `"${escapeHtml(state.userName)}" isn't on that list` : 'set your name first'}.</span>` : ''}</div>
         <div class="decision-bar-actions">
           <button class="btn btn-outline btn-sm" data-research="${ev.id}">Return to Research</button>
           <button class="btn btn-outline btn-sm" data-regen="${ev.id}">Download PDF Again</button>
           <button class="btn btn-outline btn-sm" data-email-supervisor="${ev.id}">Email Supervisor</button>
+          ${authorized
+            ? `<button class="btn btn-outline btn-sm" data-email-contracting="${ev.id}">📧 Email for Contracting</button>`
+            : `<button class="btn btn-outline btn-sm" disabled title="Only authorized approvers can send this">📧 Email for Contracting</button>`}
           ${state.teamsWebhookUrl ? `<button class="btn btn-outline btn-sm" data-notify-teams="${ev.id}">Notify Teams</button>` : ''}
           <button class="btn btn-outline btn-sm" data-notpursuing="${ev.id}">Not Pursuing</button>
           <button class="btn btn-red btn-sm" data-deny="${ev.id}">Denied by Supervisor</button>
-          <button class="btn btn-green btn-sm" data-submit="${ev.id}">Submit for Contract Processing</button>
+          ${authorized
+            ? `<button class="btn btn-green btn-sm" data-submit="${ev.id}">Submit for Contract Processing</button>`
+            : `<button class="btn btn-green btn-sm" disabled title="Only authorized approvers can submit for contract processing">Submit for Contract Processing</button>`}
         </div>`;
     } else {
       decisionButtons = `
@@ -2974,6 +3317,7 @@ function renderEventDetail(ev){
       <div class="decision-note">Submitted for contract processing${d ? ' on '+d : ''}.</div>
       <div class="decision-bar-actions">
         <button class="btn btn-outline btn-sm" data-redownload="${ev.id}">Download Summary Again</button>
+        <button class="btn btn-outline btn-sm" data-email-contracting="${ev.id}">📧 Email for Contracting Again</button>
       </div>`;
   }
 
@@ -3046,10 +3390,12 @@ function renderEventDetail(ev){
         `).join('')}
       </div>
     ` : ''}
-    <div style="display:flex;gap:8px;margin-bottom:14px;align-items:center;">
+    <div style="display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap;">
       ${ev.status===STATUS.SUBMITTED
         ? `<span class="decision-note" style="margin:0;">Locked — submitted events can't be edited or deleted.</span>`
         : `<button class="btn btn-outline btn-sm" data-edit="${ev.id}">Edit Event</button>`}
+      <button class="btn btn-outline btn-sm" data-download-event="${ev.id}">📄 Download / Print PDF</button>
+      <button class="btn btn-outline btn-sm" data-duplicate-event="${ev.id}">📅 Duplicate for Next Year</button>
       ${ev.status!==STATUS.SUBMITTED
         ? `<button class="btn btn-red btn-sm" data-delete="${ev.id}" style="margin-left:auto;">Delete</button>`
         : ''}
@@ -3061,10 +3407,24 @@ function renderEventDetail(ev){
 function renderSettingsPanel(){
   return `
   <div class="panel-header">
-    <div class="panel-title">Notifications</div>
+    <div class="panel-title">Settings</div>
     <button class="panel-close" id="closeSettingsBtn">✕</button>
   </div>
   <div class="panel-body">
+    <div class="field-group">
+      <div class="field-group-title">Approval Access Control</div>
+      <div class="hint" style="margin-bottom:10px;">Restrict who can click "Submit for Contract Processing" to specific people, by name. This is a workflow guardrail, not real security — this dashboard has no login system, so it only checks against whatever name someone's typed in for themselves. Leave this empty to let anyone submit (the default).</div>
+      <div class="field">
+        <label>Authorized Approvers (one name per line)</label>
+        <textarea id="f_authorizedApprovers" rows="4" placeholder="Jane Smith&#10;John Doe">${escapeHtml((state.authorizedApprovers||[]).join('\n'))}</textarea>
+      </div>
+      <div class="hint" style="margin-top:6px;">Names are matched case-insensitively against whatever the person entered in the "What should we call you?" prompt.</div>
+      ${state.approversStatus ? `<div class="hint" style="margin-top:8px;color:var(--accent-dark);font-weight:600;">${escapeHtml(state.approversStatus)}</div>` : ''}
+      <div style="margin-top:10px;">
+        <button class="btn btn-primary btn-sm" id="saveApproversBtn">Save Approvers</button>
+      </div>
+    </div>
+
     <div class="field-group">
       <div class="field-group-title">Microsoft Teams Webhook</div>
       <div class="hint" style="margin-bottom:10px;">Paste an Incoming Webhook URL from a Teams channel (Channel ⋯ → Connectors → Incoming Webhook). When an event is submitted for approval, a card is posted there automatically — shared across everyone using this dashboard.</div>
@@ -3636,11 +3996,28 @@ function attachHandlers(){
     });
   });
 
+  const regionSummaryPeriodTypeSelect = document.getElementById('regionSummaryPeriodType');
+  if(regionSummaryPeriodTypeSelect){
+    regionSummaryPeriodTypeSelect.addEventListener('change', ()=>{
+      state.regionSummaryPeriodType = regionSummaryPeriodTypeSelect.value;
+      state.regionSummaryPeriod = ''; // reset, since available options change with the type
+      render();
+    });
+  }
+  const regionSummaryPeriodSelect = document.getElementById('regionSummaryPeriod');
+  if(regionSummaryPeriodSelect){
+    regionSummaryPeriodSelect.addEventListener('change', ()=>{
+      state.regionSummaryPeriod = regionSummaryPeriodSelect.value;
+      render();
+    });
+  }
+
   const settingsBtn = document.getElementById('settingsBtn');
   if(settingsBtn){
     settingsBtn.addEventListener('click', ()=>{
       state.settingsOpen = true;
       state.teamsWebhookStatus = '';
+      state.approversStatus = '';
       render();
     });
   }
@@ -3660,6 +4037,26 @@ function attachHandlers(){
       }
     });
   }
+  const saveApproversBtn = document.getElementById('saveApproversBtn');
+  if(saveApproversBtn){
+    saveApproversBtn.addEventListener('click', async ()=>{
+      const textarea = document.getElementById('f_authorizedApprovers');
+      const names = textarea
+        ? textarea.value.split('\n').map(n=>n.trim()).filter(n=>n.length>0)
+        : [];
+      state.authorizedApprovers = names;
+      try{
+        await window.storage.set('authorized-approvers', JSON.stringify(names), true);
+        state.approversStatus = names.length===0
+          ? 'Saved — no restriction, anyone can submit for contract processing.'
+          : `Saved — ${names.length} authorized approver${names.length===1?'':'s'}.`;
+      }catch(e){
+        state.approversStatus = 'Could not save — please try again.';
+      }
+      render();
+    });
+  }
+
   const saveWebhookBtn = document.getElementById('saveWebhookBtn');
   if(saveWebhookBtn){
     saveWebhookBtn.addEventListener('click', async ()=>{
@@ -3738,6 +4135,19 @@ function attachHandlers(){
       deleteEvent(b.getAttribute('data-delete'));
     });
   });
+  document.querySelectorAll('[data-download-event]').forEach(b=>{
+    b.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const ev = state.events.find(x=>x.id===b.getAttribute('data-download-event'));
+      if(ev) downloadEventPDF(ev);
+    });
+  });
+  document.querySelectorAll('[data-duplicate-event]').forEach(b=>{
+    b.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      duplicateEventNextYear(b.getAttribute('data-duplicate-event'));
+    });
+  });
   document.querySelectorAll('[data-decline]').forEach(b=>{
     b.addEventListener('click', (e)=>{ e.stopPropagation(); setDecision(b.getAttribute('data-decline'), STATUS.DECLINED); });
   });
@@ -3775,6 +4185,13 @@ function attachHandlers(){
       e.stopPropagation();
       const ev = state.events.find(x=>x.id===b.getAttribute('data-email-supervisor'));
       generateApprovalEmail(ev);
+    });
+  });
+  document.querySelectorAll('[data-email-contracting]').forEach(b=>{
+    b.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const ev = state.events.find(x=>x.id===b.getAttribute('data-email-contracting'));
+      if(ev) generateContractingEmail(ev);
     });
   });
 
