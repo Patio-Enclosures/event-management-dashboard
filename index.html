@@ -243,6 +243,22 @@
   }
 
   /* ---------- Overview ---------- */
+  .signin-screen{
+    min-height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:var(--bg);
+  }
+  .signin-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:36px 34px;
+    width:100%;
+    max-width:380px;
+    box-shadow:0 12px 40px rgba(0,0,0,0.1);
+  }
   .action-strip{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px;}
   .action-pill{
     display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:12.5px;font-weight:600;
@@ -752,6 +768,7 @@
   .badge.stale-event_passed{background:var(--red-soft);color:var(--red);}
   .badge.stale-cutoff_passed{background:var(--amber-soft);color:var(--amber);}
   .badge.stale-missing_date{background:var(--slate-soft);color:var(--slate);}
+  .badge.stale-cutoff_soon{background:var(--blue-soft);color:var(--blue);}
   .badge.submitted{background:var(--green-soft);color:var(--green);}
   .chevron{color:var(--ink-faint);transition:transform 0.15s;font-size:13px;}
   .chevron.open{transform:rotate(90deg);}
@@ -1068,6 +1085,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -1113,12 +1131,26 @@ const FS_COLLECTION = 'dashboardStorage';
 // this page (unlike the Claude.ai version) is a normal, unsandboxed browser page.
 const FB_PERSONAL_KEYS = new Set(['user-display-name']);
 
+let _fbInitialized = false;
+function fbInit(){
+  if(!_fbInitialized){
+    firebase.initializeApp(FIREBASE_CONFIG);
+    _fbInitialized = true;
+  }
+}
 let _fbDb = null;
 function fbDb(){
   if(_fbDb) return _fbDb;
-  firebase.initializeApp(FIREBASE_CONFIG);
+  fbInit();
   _fbDb = firebase.firestore();
   return _fbDb;
+}
+let _fbAuth = null;
+function fbAuth(){
+  if(_fbAuth) return _fbAuth;
+  fbInit();
+  _fbAuth = firebase.auth();
+  return _fbAuth;
 }
 
 if(FIREBASE_CONFIGURED){
@@ -1198,9 +1230,11 @@ const STATUS_LABEL = {
 
 const STALENESS_LABEL = {
   missing_date: 'No Start Date',
+  cutoff_soon: 'Cutoff Approaching',
   cutoff_passed: 'Cutoff Passed',
   event_passed: 'Event Date Passed'
 };
+const CUTOFF_WARNING_DAYS = 7; // flag Researching events whose submission cutoff is this close, before it's actually too late
 
 const NOT_PURSUING_REASONS = [
   'Out of Area',
@@ -1212,6 +1246,7 @@ const NOT_PURSUING_REASONS = [
   'Duplicate or Similar Event Already Booked',
   'Poor Historical Performance',
   'Not a Fit for Brand',
+  'Not Submitted Before Cutoff',
   'Other'
 ];
 
@@ -1268,6 +1303,10 @@ function getStalenessFlag(ev){
   if(eventDate < today) return 'event_passed';
   const cutoff = getSubmissionCutoff(ev.startDate);
   if(cutoff && cutoff < today) return 'cutoff_passed';
+  if(cutoff){
+    const daysUntilCutoff = Math.round((cutoff - today) / 86400000);
+    if(daysUntilCutoff <= CUTOFF_WARNING_DAYS) return 'cutoff_soon';
+  }
   return null;
 }
 
@@ -1345,6 +1384,7 @@ let state = {
     awaitingContract:true,
     staleResearch:false,
     needsDecision:true,
+    yearTrends:false,
     activity:false
   },
   regionSummaryPeriodType:'all',
@@ -1355,7 +1395,13 @@ let state = {
   notifyPromptEventId:null,
   notPursuingPromptEventId:null,
   notPursuingReasonSelect:'',
-  notPursuingReasonOther:''
+  notPursuingReasonOther:'',
+  authChecked:false,
+  currentUser:null,
+  signInEmail:'',
+  signInPassword:'',
+  signInError:'',
+  signInLoading:false
 };
 
 function uid(){ return 'evt_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
@@ -2671,6 +2717,192 @@ function downloadContractFile(ev){
   URL.revokeObjectURL(url);
 }
 
+// Escapes a single CSV field: wraps in quotes and doubles up any internal quotes whenever the
+// value contains a comma, quote, or newline that would otherwise break the CSV structure.
+function csvField(v){
+  if(v===undefined || v===null) return '';
+  const s = String(v);
+  if(/[",\n]/.test(s)) return '"' + s.replace(/"/g,'""') + '"';
+  return s;
+}
+
+function downloadEventsCSV(){
+  const columns = [
+    ['Region', ev=>state.regionNames[ev.region]],
+    ['Branch', ev=>ev.branch],
+    ['Event Name', ev=>ev.eventName],
+    ['Status', ev=>STATUS_LABEL[ev.status]],
+    ['Start Date', ev=>ev.startDate],
+    ['End Date', ev=>ev.endDate],
+    ['Zip', ev=>ev.zip],
+    ['Venue Name', ev=>ev.venueName],
+    ['Venue Address', ev=>venueAddressDisplay(ev)],
+    ['Organizer', ev=>ev.organizer],
+    ['Contact Name', ev=>ev.contactName],
+    ['Contact Phone', ev=>ev.contactPhone],
+    ['Contact Email', ev=>ev.contactEmail],
+    ['Contract Cost', ev=>ev.contractCost],
+    ['Labor Hours', ev=>ev.laborHours],
+    ['Travel Days', ev=>ev.travelDays],
+    ['Miles Per Day', ev=>ev.milesPerDay],
+    ['Total Mileage', ev=>eventTotalMileage(ev)],
+    ['Hotel Nights', ev=>ev.hotelNights],
+    ['Misc Costs', ev=>ev.miscCosts],
+    ['Total Cost', ev=>totalCost(ev).toFixed(2)],
+    ['Target Opps', ev=>ev.forecastedOpps],
+    ['Cost Per Opp', ev=>{ const c=costPerOpp(ev); return c===null?'':c.toFixed(2); }],
+    ['Priority', ev=>ev.priorityLevel],
+    ['Submission Type', ev=>ev.submissionType],
+    ['Historical Show Code', ev=>ev.historicalShowCode],
+    ['Payment Due Date', ev=>ev.paymentDueDate],
+    ['Payment Method', ev=>ev.paymentMethod],
+    ['Registration Link', ev=>ev.registrationLink],
+    ['Not Pursuing Reason', ev=>ev.notPursuingReason],
+    ['Research Notes', ev=>ev.notes],
+    ['Final Notes', ev=>ev.finalNotes],
+    ['Created', ev=>ev.createdAt ? new Date(ev.createdAt).toLocaleDateString() : ''],
+    ['Submitted', ev=>ev.submittedAt ? new Date(ev.submittedAt).toLocaleDateString() : '']
+  ];
+  const header = columns.map(c=>csvField(c[0])).join(',');
+  const rows = state.events.map(ev => columns.map(c=>csvField(c[1](ev))).join(','));
+  const csv = [header, ...rows].join('\r\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `events-export_${toDateInputValue(new Date())}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Simple, dependency-free CSV parser: handles quoted fields, commas/newlines inside quotes,
+// and doubled-up "" as an escaped quote. Returns an array of rows, each an array of field strings.
+function parseCSV(text){
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  // Normalize line endings so \r\n and \r alone don't produce phantom blank rows.
+  text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  for(let i=0; i<text.length; i++){
+    const c = text[i];
+    if(inQuotes){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        field += c;
+      }
+    } else {
+      if(c === '"'){ inQuotes = true; }
+      else if(c === ','){ row.push(field); field = ''; }
+      else if(c === '\n'){ row.push(field); rows.push(row); row = []; field = ''; }
+      else { field += c; }
+    }
+  }
+  if(field.length>0 || row.length>0){ row.push(field); rows.push(row); }
+  return rows.filter(r => !(r.length===1 && r[0].trim()===''));
+}
+
+// Reverse lookup from a status display label ("Submitted for Approval") back to its internal
+// key ("execute"), used when importing a CSV that was itself exported from this dashboard.
+function statusKeyFromLabel(label){
+  const clean = (label||'').trim().toLowerCase();
+  const found = Object.keys(STATUS_LABEL).find(k => STATUS_LABEL[k].toLowerCase() === clean);
+  return found || STATUS.RESEARCHING;
+}
+function regionIndexFromName(name){
+  const clean = (name||'').trim().toLowerCase();
+  const idx = state.regionNames.findIndex(n => n.toLowerCase() === clean);
+  return idx >= 0 ? idx : 0;
+}
+
+// Maps CSV header names (matching the Export CSV format, case-insensitive) to a setter that
+// writes the cell value onto a fresh draft event. Unrecognized columns are ignored; missing
+// columns just leave that field at its default.
+const CSV_IMPORT_COLUMNS = {
+  'region': (ev,v)=>{ ev.region = regionIndexFromName(v); },
+  'branch': (ev,v)=>{ ev.branch = v; },
+  'event name': (ev,v)=>{ ev.eventName = v; },
+  'status': (ev,v)=>{ ev.status = statusKeyFromLabel(v); },
+  'start date': (ev,v)=>{ ev.startDate = v; },
+  'end date': (ev,v)=>{ ev.endDate = v; },
+  'zip': (ev,v)=>{ ev.zip = v; },
+  'venue name': (ev,v)=>{ ev.venueName = v; },
+  'venue address': (ev,v)=>{ ev.venueAddress = v; },
+  'organizer': (ev,v)=>{ ev.organizer = v; },
+  'contact name': (ev,v)=>{ ev.contactName = v; },
+  'contact phone': (ev,v)=>{ ev.contactPhone = v; },
+  'contact email': (ev,v)=>{ ev.contactEmail = v; },
+  'contract cost': (ev,v)=>{ ev.contractCost = v; },
+  'labor hours': (ev,v)=>{ ev.laborHours = v; },
+  'travel days': (ev,v)=>{ ev.travelDays = v; },
+  'miles per day': (ev,v)=>{ ev.milesPerDay = v; },
+  'hotel nights': (ev,v)=>{ ev.hotelNights = v; },
+  'misc costs': (ev,v)=>{ ev.miscCosts = v; },
+  'target opps': (ev,v)=>{ ev.forecastedOpps = v; },
+  'priority': (ev,v)=>{ ev.priorityLevel = v; },
+  'submission type': (ev,v)=>{ ev.submissionType = v; },
+  'historical show code': (ev,v)=>{ ev.historicalShowCode = v; },
+  'payment due date': (ev,v)=>{ ev.paymentDueDate = v; },
+  'payment method': (ev,v)=>{ ev.paymentMethod = v; },
+  'registration link': (ev,v)=>{ ev.registrationLink = v; },
+  'not pursuing reason': (ev,v)=>{ ev.notPursuingReason = v; },
+  'research notes': (ev,v)=>{ ev.notes = v; },
+  'final notes': (ev,v)=>{ ev.finalNotes = v; }
+};
+
+// Parses CSV text and returns { events, skipped } -- new event drafts ready to add to
+// state.events, plus a count of rows skipped for missing an Event Name (the one field we
+// can't sensibly default). Every row becomes a brand-new event with a fresh ID -- this does
+// not try to match against or overwrite existing events.
+function parseEventsFromCSV(text){
+  const rows = parseCSV(text);
+  if(rows.length < 2) return { events: [], skipped: 0 };
+  const headers = rows[0].map(h => h.trim().toLowerCase());
+  const events = [];
+  let skipped = 0;
+  for(let r=1; r<rows.length; r++){
+    const cells = rows[r];
+    if(cells.every(c => c.trim()==='')) continue; // blank row
+    const draft = emptyDraft(0);
+    headers.forEach((h, colIdx)=>{
+      const setter = CSV_IMPORT_COLUMNS[h];
+      if(setter && cells[colIdx]!==undefined) setter(draft, cells[colIdx].trim());
+    });
+    if(!draft.eventName.trim()){ skipped++; continue; }
+    draft.id = uid();
+    draft.createdAt = Date.now();
+    draft.history = [];
+    events.push(draft);
+  }
+  return { events, skipped };
+}
+
+function importEventsFromCSVFile(file){
+  const reader = new FileReader();
+  reader.onload = () => {
+    const { events, skipped } = parseEventsFromCSV(String(reader.result));
+    if(events.length === 0){
+      alert(skipped>0
+        ? `No events could be imported -- ${skipped} row${skipped===1?'':'s'} skipped for missing an Event Name.`
+        : 'No rows found in that file.');
+      return;
+    }
+    const skipNote = skipped>0 ? ` (${skipped} row${skipped===1?'':'s'} skipped for missing an Event Name)` : '';
+    if(!confirm(`Import ${events.length} event${events.length===1?'':'s'} from "${file.name}"?${skipNote}\n\nThese will be added as brand-new events -- this does not check for or merge duplicates.`)) return;
+    state.events = state.events.concat(events);
+    logActivity(null, null, 'Bulk imported events', `${events.length} events from ${file.name}`);
+    persist();
+    render();
+    alert(`Imported ${events.length} event${events.length===1?'':'s'}.`);
+  };
+  reader.onerror = () => alert('Could not read that file. Please try again.');
+  reader.readAsText(file);
+}
+
 function downloadContractSummary(ev){
   const region = state.regionNames[ev.region];
   const today = new Date(ev.submittedAt || Date.now()).toLocaleDateString(undefined,{year:'numeric',month:'long',day:'numeric'});
@@ -2753,8 +2985,63 @@ function renameRegion(idx, newName){
 
 /* ---------------- Rendering ---------------- */
 
+function renderSignInScreen(){
+  return `
+  <div class="signin-screen">
+    <div class="signin-card">
+      <div class="brand-eyebrow" style="color:var(--accent-dark);">Field Research &amp; Contracting</div>
+      <h1 style="font-family:var(--font-display);font-size:26px;font-weight:600;margin:2px 0 22px 0;color:var(--ink);">Regional Events Dashboard</h1>
+      <div class="field">
+        <label>Email</label>
+        <input id="signInEmail" type="email" value="${escapeHtml(state.signInEmail)}" placeholder="you@company.com" autocomplete="username"/>
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input id="signInPassword" type="password" value="" placeholder="••••••••" autocomplete="current-password"/>
+      </div>
+      ${state.signInError ? `<div class="field-note-warn" style="margin-bottom:12px;">${escapeHtml(state.signInError)}</div>` : ''}
+      <button class="btn btn-primary" id="signInSubmit" style="width:100%;justify-content:center;" ${state.signInLoading?'disabled':''}>${state.signInLoading ? 'Signing in…' : 'Sign In'}</button>
+      <div class="hint" style="margin-top:16px;text-align:center;">Don't have an account? Ask your admin to add you in Firebase Authentication.</div>
+    </div>
+  </div>`;
+}
+
+function attachSignInHandlers(){
+  const emailInput = document.getElementById('signInEmail');
+  const passwordInput = document.getElementById('signInPassword');
+  const submitBtn = document.getElementById('signInSubmit');
+  if(emailInput){
+    emailInput.addEventListener('input', ()=>{ state.signInEmail = emailInput.value; });
+  }
+  const doSignIn = () => {
+    const email = emailInput ? emailInput.value.trim() : '';
+    const password = passwordInput ? passwordInput.value : '';
+    if(!email || !password){
+      state.signInError = 'Enter both your email and password.';
+      render();
+      return;
+    }
+    signIn(email, password);
+  };
+  if(passwordInput){
+    passwordInput.addEventListener('keydown', (e)=>{ if(e.key==='Enter') doSignIn(); });
+  }
+  if(submitBtn){
+    submitBtn.addEventListener('click', doSignIn);
+  }
+}
+
 function render(){
   const root = document.getElementById('root');
+  if(!state.authChecked){
+    root.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-mono);color:var(--ink-soft);">Checking sign-in status…</div>`;
+    return;
+  }
+  if(!state.currentUser){
+    root.innerHTML = renderSignInScreen();
+    attachSignInHandlers();
+    return;
+  }
   if(!state.loaded){
     root.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:var(--font-mono);color:var(--ink-soft);">Loading ledger…</div>`;
     return;
@@ -2795,7 +3082,7 @@ function render(){
     const q = state.searchQuery.trim().toLowerCase();
     if(q){
       out = out.filter(ev=>{
-        const haystack = [ev.eventName, ev.venueName, ev.organizer, ev.branch]
+        const haystack = [ev.eventName, ev.venueName, ev.organizer, ev.branch, ev.notes, ev.finalNotes, ev.contactName, ev.contactEmail, ev.contactPhone]
           .filter(Boolean).join(' ').toLowerCase();
         return haystack.includes(q);
       });
@@ -2869,7 +3156,7 @@ function render(){
     const searchSortBarHtmlMaster = regionEventsAll.length===0 ? '' : `
       <div class="search-sort-bar">
         <div class="search-box">
-          <input type="text" id="regionSearchInput" placeholder="Search by name, venue, organizer, or branch…" value="${escapeHtml(state.searchQuery)}"/>
+          <input type="text" id="regionSearchInput" placeholder="Search name, venue, organizer, branch, notes, or contact…" value="${escapeHtml(state.searchQuery)}"/>
           ${state.searchQuery ? `<button class="search-clear" id="clearSearchBtn" title="Clear search">✕</button>` : ''}
         </div>
         <select id="regionSortSelect">
@@ -2930,7 +3217,7 @@ function render(){
     const searchSortBarHtml = regionEventsAll.length===0 ? '' : `
       <div class="search-sort-bar">
         <div class="search-box">
-          <input type="text" id="regionSearchInput" placeholder="Search by name, venue, organizer, or branch…" value="${escapeHtml(state.searchQuery)}"/>
+          <input type="text" id="regionSearchInput" placeholder="Search name, venue, organizer, branch, notes, or contact…" value="${escapeHtml(state.searchQuery)}"/>
           ${state.searchQuery ? `<button class="search-clear" id="clearSearchBtn" title="Clear search">✕</button>` : ''}
         </div>
         <select id="regionSortSelect">
@@ -2978,6 +3265,14 @@ function render(){
           <div class="stat"><div class="stat-label">Submitted</div><div class="stat-value">${submittedCount}</div></div>
           <div class="stat"><div class="stat-label">Est. Pipeline Value</div><div class="stat-value">${money(totalPipeline)}</div></div>
           ${pendingApprovalCount>0 ? `<button class="pending-approval-badge" id="pendingApprovalBadge">⚠ ${pendingApprovalCount} Pending Approval</button>` : ''}
+          ${state.currentUser && state.currentUser.email !== 'unconfigured' ? `
+          <div class="stat" style="text-align:right;">
+            <div class="stat-label">Signed in as</div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:#B7D9D7;">${escapeHtml(state.currentUser.email)} · <a href="#" id="signOutLink" style="color:#fff;text-decoration:underline;">Sign out</a></div>
+          </div>` : ''}
+          <button class="btn btn-outline btn-sm" id="exportCsvBtn" style="align-self:center;">⬇ Export CSV</button>
+          <button class="btn btn-outline btn-sm" id="importCsvBtn" style="align-self:center;">⬆ Import CSV</button>
+          <input type="file" id="importCsvFile" accept=".csv" style="display:none;"/>
           <button class="btn btn-outline btn-sm" id="settingsBtn" style="align-self:center;">⚙ Settings</button>
         </div>
       </div>
@@ -3238,7 +3533,7 @@ function renderOverview(allEvents){
         </div>
       `;}).join('') + `</div>`;
 
-  const STALE_SEVERITY = { event_passed: 0, cutoff_passed: 1, missing_date: 2 };
+  const STALE_SEVERITY = { event_passed: 0, cutoff_passed: 1, cutoff_soon: 2, missing_date: 3 };
   const staleResearch = allResearching
     .map(ev=>({ ev, flag: getStalenessFlag(ev) }))
     .filter(x=>x.flag)
@@ -3247,7 +3542,7 @@ function renderOverview(allEvents){
   const staleResearchHtml = staleResearch.length===0
     ? `<div class="empty" style="padding:28px;"><div class="empty-title" style="font-size:16px;">Nothing stale</div><div>Every researching event has a start date, a valid submission window, and hasn't already happened.</div></div>`
     : `<div class="needs-decision-list">` + staleResearch.map(({ev,flag})=>{
-        const railColor = flag==='event_passed' ? 'var(--red)' : flag==='cutoff_passed' ? 'var(--amber)' : 'var(--slate)';
+        const railColor = flag==='event_passed' ? 'var(--red)' : flag==='cutoff_passed' ? 'var(--amber)' : flag==='cutoff_soon' ? 'var(--blue)' : 'var(--slate)';
         return `
         <div class="needs-decision-row" style="border-left-color:${railColor};">
           <div class="needs-decision-main" data-goto-event="${ev.id}" data-goto-event-region="${ev.region}" style="cursor:pointer;">
@@ -3295,6 +3590,36 @@ function renderOverview(allEvents){
     </div>
   `;
 
+  // Year-over-year rollup, grouped by each event's Start Date year (events with no date are
+  // excluded, since they can't be placed on a timeline). Sorted most recent year first.
+  const yearGroups = {};
+  allEvents.forEach(ev=>{
+    if(!ev.startDate) return;
+    const year = ev.startDate.slice(0,4);
+    if(!/^\d{4}$/.test(year)) return;
+    if(!yearGroups[year]) yearGroups[year] = { year, count:0, submittedCount:0, submittedValue:0, pipelineValue:0 };
+    const g = yearGroups[year];
+    g.count++;
+    if(ev.status===STATUS.SUBMITTED){ g.submittedCount++; g.submittedValue += totalCost(ev); }
+    if(ev.status!==STATUS.DECLINED && ev.status!==STATUS.NOT_PURSUING) g.pipelineValue += totalCost(ev);
+  });
+  const yearRollups = Object.values(yearGroups).sort((a,b)=> b.year.localeCompare(a.year));
+  const maxSubmittedValue = Math.max(1, ...yearRollups.map(g=>g.submittedValue));
+
+  const yearTrendsHtml = yearRollups.length===0
+    ? `<div class="empty" style="padding:24px;"><div class="empty-title" style="font-size:15px;">Not enough dated events yet</div><div>Once events have start dates spanning more than one year, a year-over-year comparison will show up here.</div></div>`
+    : `<div class="region-table-wrap" style="padding:16px 18px;">` + yearRollups.map(g=>`
+        <div style="margin-bottom:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;font-family:var(--font-mono);font-size:12px;">
+            <span style="font-weight:700;color:var(--ink);">${escapeHtml(g.year)}</span>
+            <span style="color:var(--ink-faint);">${g.count} event${g.count===1?'':'s'} · ${g.submittedCount} submitted · ${money(g.submittedValue)} contracted</span>
+          </div>
+          <div style="height:10px;background:var(--bg);border-radius:5px;overflow:hidden;">
+            <div style="height:100%;width:${(g.submittedValue/maxSubmittedValue*100).toFixed(1)}%;background:var(--green);border-radius:5px;"></div>
+          </div>
+        </div>
+      `).join('') + `</div>`;
+
   return `
     ${kpiHtml}
     ${actionStripHtml}
@@ -3305,6 +3630,12 @@ function renderOverview(allEvents){
           <div class="hint" style="margin:-6px 0 10px 2px;">Click a region to see its branch-level breakdown.</div>
           ${periodFilterHtml}
           ${regionTableHtml}
+        ` : ''}
+
+        ${sectionHeader('yearTrends', 'Year-Over-Year Trends', null, '📈')}
+        ${state.overviewSectionsOpen.yearTrends ? `
+          <div class="hint" style="margin:-6px 0 10px 2px;">Submitted contract value by year, grouped by each event's start date.</div>
+          ${yearTrendsHtml}
         ` : ''}
 
         ${sectionHeader('activity', 'Recent Activity', null, '📋')}
@@ -3680,7 +4011,7 @@ function renderSettingsPanel(){
         <label>Authorized Approvers (one name per line)</label>
         <textarea id="f_authorizedApprovers" rows="4" placeholder="Jane Smith&#10;John Doe">${escapeHtml((state.authorizedApprovers||[]).join('\n'))}</textarea>
       </div>
-      <div class="hint" style="margin-top:6px;">Names are matched case-insensitively against whatever the person entered in the "What should we call you?" prompt.</div>
+      <div class="hint" style="margin-top:6px;">Matched case-insensitively against the signed-in account's name, or the part of their email before the @ if no display name is set on their Firebase account (e.g. "jane.doe" for jane.doe@company.com).</div>
       ${state.approversStatus ? `<div class="hint" style="margin-top:8px;color:var(--accent-dark);font-weight:600;">${escapeHtml(state.approversStatus)}</div>` : ''}
       <div style="margin-top:10px;">
         <button class="btn btn-primary btn-sm" id="saveApproversBtn">Save Approvers</button>
@@ -4133,7 +4464,19 @@ function attachHandlers(){
     row.addEventListener('click', ()=>{
       state.activeRegion = parseInt(row.getAttribute('data-goto-event-region'),10);
       state.expandedEventId = row.getAttribute('data-goto-event');
+      // Clear any filters left over from previous browsing on that tab -- otherwise the target
+      // event can end up excluded from the filtered list and never actually appear on screen.
+      state.searchQuery = '';
+      state.filterBranch = '';
+      state.filterStatus = '';
+      state.filterDateFrom = '';
+      state.filterDateTo = '';
+      state.sortBy = 'startDateAsc';
       render();
+      setTimeout(()=>{
+        const card = document.querySelector(`[data-toggle="${state.expandedEventId}"]`);
+        if(card) card.scrollIntoView({behavior:'smooth', block:'center'});
+      }, 50);
     });
   });
 
@@ -4293,6 +4636,29 @@ function attachHandlers(){
     regionSummaryPeriodSelect.addEventListener('change', ()=>{
       state.regionSummaryPeriod = regionSummaryPeriodSelect.value;
       render();
+    });
+  }
+
+  const exportCsvBtn = document.getElementById('exportCsvBtn');
+  if(exportCsvBtn){
+    exportCsvBtn.addEventListener('click', downloadEventsCSV);
+  }
+  const importCsvBtn = document.getElementById('importCsvBtn');
+  const importCsvFile = document.getElementById('importCsvFile');
+  if(importCsvBtn && importCsvFile){
+    importCsvBtn.addEventListener('click', ()=> importCsvFile.click());
+    importCsvFile.addEventListener('change', ()=>{
+      const file = importCsvFile.files && importCsvFile.files[0];
+      if(file) importEventsFromCSVFile(file);
+      importCsvFile.value = ''; // allow re-selecting the same file later
+    });
+  }
+
+  const signOutLink = document.getElementById('signOutLink');
+  if(signOutLink){
+    signOutLink.addEventListener('click', (e)=>{
+      e.preventDefault();
+      if(confirm('Sign out of the dashboard?')) signOutUser();
     });
   }
 
@@ -4752,7 +5118,47 @@ function attachHandlers(){
   });
 }
 
-loadData();
+// Signs a user in with email/password. Accounts are created ahead of time by an admin in the
+// Firebase console (Authentication -> Users -> Add user) -- there's no self-serve sign-up here.
+async function signIn(email, password){
+  state.signInError = '';
+  state.signInLoading = true;
+  render();
+  try{
+    await fbAuth().signInWithEmailAndPassword(email, password);
+    // onAuthStateChanged below picks up the result and loads the dashboard.
+  }catch(e){
+    state.signInLoading = false;
+    state.signInError = e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password' || e.code === 'auth/user-not-found'
+      ? 'Incorrect email or password.'
+      : `Sign-in failed: ${e.message}`;
+    render();
+  }
+}
+async function signOutUser(){
+  try{ await fbAuth().signOut(); }catch(e){ console.error('Sign out failed', e); }
+}
+
+if(FIREBASE_CONFIGURED){
+  fbAuth().onAuthStateChanged(function(user){
+    state.authChecked = true;
+    state.currentUser = user;
+    state.signInLoading = false;
+    if(user){
+      state.userName = user.displayName || (user.email ? user.email.split('@')[0] : 'Someone');
+      loadData();
+    } else {
+      render();
+    }
+  });
+  render(); // initial paint while Firebase resolves the current auth state
+} else {
+  // No real Firebase project configured yet -- skip auth entirely so the existing "Firebase
+  // isn't configured" warning banner is what people see, not a sign-in screen that can't work.
+  state.authChecked = true;
+  state.currentUser = { email: 'unconfigured' };
+  loadData();
+}
 </script>
 </body>
 </html>
