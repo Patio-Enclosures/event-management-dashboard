@@ -654,6 +654,8 @@
   .btn-primary{background:var(--accent);color:#fff;}
   .btn-primary:hover{filter:brightness(1.08);}
   .btn-outline{background:transparent;color:var(--ink);border-color:var(--border);}
+  .btn-header{background:rgba(255,255,255,0.1);color:#fff;border:1px solid rgba(255,255,255,0.3);}
+  .btn-header:hover{background:rgba(255,255,255,0.2);}
   .btn-outline:hover{background:var(--surface);}
   .btn-blue{background:var(--blue);color:#fff;}
   .btn-blue:hover{filter:brightness(1.08);}
@@ -1235,6 +1237,13 @@ const STALENESS_LABEL = {
   event_passed: 'Event Date Passed'
 };
 const CUTOFF_WARNING_DAYS = 7; // flag Researching events whose submission cutoff is this close, before it's actually too late
+
+// Only these signed-in accounts can see or open the Settings panel (Teams webhook config,
+// approver access control). Everyone else's Settings button is hidden entirely.
+const SETTINGS_ADMIN_EMAILS = ['paula.shoemaker@greatdayimprovements.com'];
+function isSettingsAdmin(){
+  return !!(state.currentUser && state.currentUser.email && SETTINGS_ADMIN_EMAILS.includes(state.currentUser.email.toLowerCase()));
+}
 
 const NOT_PURSUING_REASONS = [
   'Out of Area',
@@ -3270,10 +3279,10 @@ function render(){
             <div class="stat-label">Signed in as</div>
             <div style="font-family:var(--font-mono);font-size:11px;color:#B7D9D7;">${escapeHtml(state.currentUser.email)} · <a href="#" id="signOutLink" style="color:#fff;text-decoration:underline;">Sign out</a></div>
           </div>` : ''}
-          <button class="btn btn-outline btn-sm" id="exportCsvBtn" style="align-self:center;">⬇ Export CSV</button>
-          <button class="btn btn-outline btn-sm" id="importCsvBtn" style="align-self:center;">⬆ Import CSV</button>
+          <button class="btn btn-header btn-sm" id="exportCsvBtn" style="align-self:center;">⬇ Export CSV</button>
+          <button class="btn btn-header btn-sm" id="importCsvBtn" style="align-self:center;">⬆ Import CSV</button>
           <input type="file" id="importCsvFile" accept=".csv" style="display:none;"/>
-          <button class="btn btn-outline btn-sm" id="settingsBtn" style="align-self:center;">⚙ Settings</button>
+          ${isSettingsAdmin() ? `<button class="btn btn-header btn-sm" id="settingsBtn" style="align-self:center;">⚙ Settings</button>` : ''}
         </div>
       </div>
       <div class="tab-strip">${tabsHtml}</div>
@@ -3301,9 +3310,9 @@ function render(){
       </div>
     </div>
 
-    <div class="overlay ${state.settingsOpen?'open':''}" id="settingsOverlay">
+    <div class="overlay ${state.settingsOpen && isSettingsAdmin() ?'open':''}" id="settingsOverlay">
       <div class="panel" id="settingsPanelStop" style="max-width:480px;">
-        ${state.settingsOpen ? renderSettingsPanel() : ''}
+        ${state.settingsOpen && isSettingsAdmin() ? renderSettingsPanel() : ''}
       </div>
     </div>
 
