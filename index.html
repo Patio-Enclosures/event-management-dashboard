@@ -1245,6 +1245,13 @@ function isSettingsAdmin(){
   return !!(state.currentUser && state.currentUser.email && SETTINGS_ADMIN_EMAILS.includes(state.currentUser.email.toLowerCase()));
 }
 
+const SUPERVISOR_EMAILS = [
+  'angelique.critz@greatdayimprovements.com',
+  'chris.winston@greatdayimprovements.com',
+  'paula.shoemaker@greatdayimprovements.com',
+  'trevor.morrissey@greatdayimprovements.com'
+];
+
 const NOT_PURSUING_REASONS = [
   'Out of Area',
   'CPO Too High',
@@ -1655,7 +1662,6 @@ const REQUIRED_FIELDS = [
   ['endDate','End Date'],
   ['contractCost','Contract Cost'],
   ['laborHours','Forecasted Labor Hours'],
-  ['mileage','Forecasted Mileage'],
   ['hotelNights','# of Hotel Nights'],
   ['miscCosts','Misc. Costs'],
   ['forecastedOpps','Target Opps'],
@@ -1667,12 +1673,20 @@ const REQUIRED_FIELDS = [
 ];
 
 function getMissingFields(ev){
-  return REQUIRED_FIELDS
+  const missing = REQUIRED_FIELDS
     .filter(([key])=>{
       const v = ev[key];
       return v===undefined || v===null || String(v).trim()==='';
     })
     .map(([, label])=>label);
+  // Mileage moved from one flat field to Travel Days x Miles Per Day -- accept either the new
+  // pair, or (for older events that haven't been re-edited yet) the legacy flat total.
+  const hasNewMileage = ev.travelDays && String(ev.travelDays).trim()!=='' && ev.milesPerDay && String(ev.milesPerDay).trim()!=='';
+  const hasLegacyMileage = ev.mileage && String(ev.mileage).trim()!=='';
+  if(!hasNewMileage && !hasLegacyMileage){
+    missing.push('Forecasted Mileage (Travel Days & Miles Per Day)');
+  }
+  return missing;
 }
 
 function getMissingApprovalFields(ev){
@@ -4178,7 +4192,14 @@ function renderPanel(){
         </select>
       </div>
       <div class="field-row">
-        <div class="field"><label>Supervisor's Email</label><input id="f_supervisorEmail" type="email" value="${escapeHtml(d.supervisorEmail)}"/></div>
+        <div class="field">
+          <label>Supervisor's Email</label>
+          <select id="f_supervisorEmail">
+            <option value="" ${!d.supervisorEmail?'selected':''}>Select…</option>
+            ${d.supervisorEmail && !SUPERVISOR_EMAILS.includes(d.supervisorEmail) ? `<option value="${escapeHtml(d.supervisorEmail)}" selected>${escapeHtml(d.supervisorEmail)} (not in list)</option>` : ''}
+            ${SUPERVISOR_EMAILS.map(email=>`<option value="${escapeHtml(email)}" ${d.supervisorEmail===email?'selected':''}>${escapeHtml(email)}</option>`).join('')}
+          </select>
+        </div>
         <div class="field">
           <label>Priority Level</label>
           <select id="f_priorityLevel" class="${d.priorityLevel==='high'?'priority-high':d.priorityLevel==='medium'?'priority-medium':d.priorityLevel==='low'?'priority-low':''}">
