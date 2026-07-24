@@ -3009,6 +3009,7 @@ function buildExhibitDaySyncPayload(ev){
     budget_booth_reservation: num(ev.contractCost),
     budget_travel: mileageDollars(ev) + hotelDollars(ev) + perDiemDollars(ev),
     budget_misc_expenses: num(ev.miscCosts),
+    budget_attendee_registrations: laborDollars(ev),
     custom_fields
   };
 }
