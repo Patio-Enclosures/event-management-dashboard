@@ -2291,6 +2291,10 @@ function openEditPanel(ev){
     alert('This event has already been submitted for contract processing and can no longer be edited.');
     return;
   }
+  if(ev.status===STATUS.EXECUTE && !isAuthorizedApprover()){
+    alert('This event is Submitted for Approval and awaiting review. Only authorized approvers can edit it while it\'s in this state -- ask an approver to make changes, or wait until it moves to contract processing.');
+    return;
+  }
   const recovery = checkForDraftRecovery();
   if(recovery && recovery.draft && recovery.editingEventId===ev.id){
     if(confirm(`We found unsaved changes to "${ev.eventName}" from ${minutesAgoLabel(recovery.savedAt)} (possibly lost to a browser issue). Restore them and keep editing?\n\nChoose Cancel to discard them and open the event as it's currently saved instead.`)){
